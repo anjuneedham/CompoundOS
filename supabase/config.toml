@@ -1,0 +1,5 @@
+# Minimal Supabase CLI config. Run `supabase init` locally to regenerate full config if needed.
+project_id = "compoundos"
+
+[db]
+major_version = 15

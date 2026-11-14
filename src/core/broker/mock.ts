@@ -152,6 +152,33 @@ export class MockBroker implements BrokerAdapter {
     return res;
   }
 
+  /** Serialize for persistence between stateless serverless invocations. */
+  exportState() {
+    const ser = (p: Position) => ({ ...p, qty: p.qty.toString(), entryPrice: p.entryPrice.toString(), stopLoss: p.stopLoss?.toString(), takeProfit: p.takeProfit?.toString(), openedAt: p.openedAt.toISOString() });
+    return { balance: this.balance.toString(), seq: this.seq, positions: [...this.positions.values()].map(ser), orderIds: [...this.orders.keys()].slice(-500) };
+  }
+  importState(s: ReturnType<MockBroker["exportState"]>) {
+    this.balance = D(s.balance); this.seq = s.seq;
+    this.positions = new Map(s.positions.map((p) => [p.id, { ...p, qty: D(p.qty), entryPrice: D(p.entryPrice), stopLoss: p.stopLoss ? D(p.stopLoss) : undefined, takeProfit: p.takeProfit ? D(p.takeProfit) : undefined, openedAt: new Date(p.openedAt) }]));
+    for (const id of s.orderIds) if (!this.orders.has(id)) this.orders.set(id, { clientOrderId: id, status: "filled", filledQty: ZERO, fee: ZERO, message: "historical" });
+  }
+
+  /** Close positions whose stop/target was touched by the latest bar. Returns closures. */
+  async processStopsAndTargets(bars: Record<string, { high: number; low: number }>) {
+    const closed: { position: Position; result: OrderResult; pnl: Decimal; reason: "stop" | "target" }[] = [];
+    for (const p of [...this.positions.values()]) {
+      const b = bars[p.symbol]; if (!b) continue;
+      const hitStop = p.stopLoss && (p.side === "buy" ? b.low <= p.stopLoss.toNumber() : b.high >= p.stopLoss.toNumber());
+      const hitTgt = p.takeProfit && (p.side === "buy" ? b.high >= p.takeProfit.toNumber() : b.low <= p.takeProfit.toNumber());
+      if (!hitStop && !hitTgt) continue;
+      const before = this.balance;
+      this.setPrice(p.symbol, (hitStop ? p.stopLoss! : p.takeProfit!).toString()); // conservative: stop first
+      const result = await this.closePosition(p.id);
+      closed.push({ position: p, result, pnl: this.balance.minus(before), reason: hitStop ? "stop" : "target" });
+    }
+    return closed;
+  }
+
   /** Test hook: simulate a position appearing/disappearing outside our system. */
   injectExternalPosition(p: Position) { this.positions.set(p.id, p); }
 }
