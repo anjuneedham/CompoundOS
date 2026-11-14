@@ -6,7 +6,10 @@
 1. Create a project (free tier is fine for paper trading).
 2. SQL Editor → run each file in `supabase/migrations/` **in filename order**.
 3. Auth → URL configuration: set Site URL to your Vercel URL; add `https://<app>/auth/callback` as a redirect URL.
-4. Settings → API: copy URL, anon/publishable key, service-role key (keep secret).
+4. Project Settings → **API Keys**: copy the **publishable** key (`sb_publishable_…`) and create/copy a **secret** key (`sb_secret_…`). Name the secret key e.g. `compoundos-vercel` so it can be revoked independently. Project URL is under Project Settings → Data API.
+   - Works with a Supabase project in **any account/organization** — the app only needs the URL and these two keys; nothing is tied to the account used during development.
+   - Legacy `anon` / `service_role` keys still work (fallback), but secret keys are preferred: they can be rotated individually and are rejected if used from a browser.
+   - Never put the secret key in a `NEXT_PUBLIC_` variable — the app refuses to start that way.
 
 ## 2. Vercel
 1. Import the GitHub repo. Framework: Next.js (auto).
@@ -24,7 +27,7 @@ select cron.schedule('compoundos-paper-cycle', '*/15 * * * *', $$
   );
 $$);
 ```
-Users enable automation and choose their interval in Settings; the route runs only due jobs.
+Users enable each schedule (risk monitor, paper cycle, AI research, reports) and its interval in Settings; the route runs only due jobs, risk monitor first. The pg_cron interval should be ≤ the shortest job interval (15 min).
 
 ## 4. Claude
 Set `ANTHROPIC_API_KEY` in Vercel (server). Optional `ANTHROPIC_MODEL` (default `claude-opus-5-5`) and `ANTHROPIC_EFFORT` (default `medium`; `low` reduces cost).

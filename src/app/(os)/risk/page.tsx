@@ -3,7 +3,7 @@ import { paperSnapshot } from "@/server/queries";
 import { D, sum } from "@/core/money/decimal";
 import { PageHeader, Section, Stat, Empty, Badge, money } from "@/components/ui";
 import { ActionButton } from "@/components/ActionButton";
-import { killSwitch, clearHalts } from "@/server/actions";
+import { killSwitch, clearHalts, runRiskMonitorNow } from "@/server/actions";
 import { LimitsForm } from "./LimitsForm";
 
 export default async function Risk() {
@@ -25,7 +25,7 @@ export default async function Risk() {
   const remaining = rl ? Math.max(0, Number(rl.max_daily_loss_pct) - dayLoss) : 0;
   return (
     <>
-      <PageHeader title="Risk Centre" subtitle="Deterministic safeguards. Independent of AI and active even when Claude is unavailable." right={<div className="flex gap-2"><ActionButton action={killSwitch} label="KILL SWITCH" variant="btn-danger" confirm={`Activate kill switch? New orders stop immediately. Emergency policy: ${s?.emergency_policy}.`} />{active.length > 0 && <ActionButton action={clearHalts} label="Clear halts" confirm="Clear all active halts and allow new orders?" />}</div>} />
+      <PageHeader title="Risk Centre" subtitle="Deterministic safeguards. Independent of AI and active even when Claude is unavailable." right={<div className="flex flex-wrap gap-2"><ActionButton action={runRiskMonitorNow} label="Run risk monitor" /><ActionButton action={killSwitch} label="KILL SWITCH" variant="btn-danger" confirm={`Activate kill switch? New orders stop immediately. Emergency policy: ${s?.emergency_policy}.`} />{active.length > 0 && <ActionButton action={clearHalts} label="Clear halts" confirm="Clear all active halts and allow new orders?" />}</div>} />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <Stat label="Daily loss" value={`${dayLoss.toFixed(2)}%`} sub={`limit ${rl?.max_daily_loss_pct}% · remaining ${remaining.toFixed(2)}%`} tone={dayLoss >= Number(rl?.max_daily_loss_pct) * 0.75 ? "bad" : undefined} />
         <Stat label="Drawdown from peak" value={`${dd.toFixed(2)}%`} sub={`limit ${rl?.max_drawdown_pct}%`} tone={dd >= Number(rl?.max_drawdown_pct) * 0.75 ? "bad" : undefined} />

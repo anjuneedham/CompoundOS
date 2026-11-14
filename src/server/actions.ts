@@ -2,7 +2,8 @@
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { requireUser, supabaseAdmin } from "@/lib/supabase/server";
-import { runPaperCycle, activateKillSwitch, runAiResearch } from "./paper";
+import { runPaperCycle, activateKillSwitch, runAiResearch, runRiskMonitor } from "./paper";
+import { runStrategyReview, runRiskReview, generateReport } from "./ai-jobs";
 import { STRATEGIES } from "@/core/strategy/types";
 import { runBacktest, splitInOut, walkForward } from "@/core/backtest/engine";
 import { simulatedCandles, SIM_SYMBOLS } from "@/core/market/simulated";
@@ -98,9 +99,7 @@ export async function backtest(input: unknown) {
 export async function runAi(symbol: string, execute: boolean) {
   const s = z.enum(SIM_SYMBOLS as [string, ...string[]]).parse(symbol);
   const { userId, db } = await ctx();
-  // simple rate limit: one AI run per 30s per user
-  const { data: last } = await db.from("ai_decision_logs").select("created_at").eq("user_id", userId).eq("cached", false).order("created_at", { ascending: false }).limit(1).maybeSingle();
-  if (last && Date.now() - new Date(last.created_at).getTime() < 30_000) return { ok: false, error: "rate limited: wait 30s between AI runs" };
+  const rl = await aiRateLimit(db, userId); if (rl) return rl;
   const r = await runAiResearch(db, userId, s, { execute });
   await audit(db, userId, "ai_research_run", { symbol: s, execute, ok: r.ok }); done();
   return JSON.parse(JSON.stringify(r));
@@ -121,13 +120,51 @@ export async function updateRiskLimits(input: unknown, confirm: string) {
   await audit(db, userId, "risk_limits_changed", { before, after: v }); done();
 }
 
-const SettingsInput = z.object({ emergency_policy: z.enum(["halt_only", "close_all", "close_losing"]), ai_daily_token_budget: z.number().int().min(0).max(5_000_000), automation: z.boolean(), interval_minutes: z.number().int().min(15).max(1440) });
+const JOB_NAMES = ["risk_monitor", "paper_cycle", "ai_research", "daily_report"] as const;
+const SettingsInput = z.object({
+  emergency_policy: z.enum(["halt_only", "close_all", "close_losing"]), ai_daily_token_budget: z.number().int().min(0).max(5_000_000),
+  jobs: z.array(z.object({ job: z.enum(JOB_NAMES), enabled: z.boolean(), interval_minutes: z.number().int().min(15).max(10080) })).max(4),
+});
 export async function updateSettings(input: unknown) {
   const v = SettingsInput.parse(input);
   const { userId, db } = await ctx();
   await db.from("user_settings").update({ emergency_policy: v.emergency_policy, ai_daily_token_budget: v.ai_daily_token_budget }).eq("user_id", userId);
-  await db.from("scheduled_jobs").upsert({ user_id: userId, job: "paper_cycle", enabled: v.automation, interval_minutes: v.interval_minutes }, { onConflict: "user_id,job" });
+  if (v.jobs.length) await db.from("scheduled_jobs").upsert(v.jobs.map((j) => ({ user_id: userId, ...j })), { onConflict: "user_id,job" });
   await audit(db, userId, "settings_changed", v); done();
+}
+
+/** AI rate limit shared by all manual AI buttons: one call per 30s per user. */
+async function aiRateLimit(db: ReturnType<typeof supabaseAdmin>, userId: string) {
+  const { data: last } = await db.from("ai_decision_logs").select("created_at").eq("user_id", userId).eq("cached", false).order("created_at", { ascending: false }).limit(1).maybeSingle();
+  return last && Date.now() - new Date(last.created_at).getTime() < 30_000 ? { ok: false as const, error: "rate limited: wait 30s between AI runs" } : null;
+}
+export async function reviewStrategy(strategyId: string) {
+  z.string().uuid().parse(strategyId);
+  const { userId, db } = await ctx();
+  const rl = await aiRateLimit(db, userId); if (rl) return rl;
+  const r = await runStrategyReview(db, userId, strategyId);
+  await audit(db, userId, "ai_strategy_review", { strategyId, ok: r.ok }); done();
+  return r;
+}
+export async function reviewRisk() {
+  const { userId, db } = await ctx();
+  const rl = await aiRateLimit(db, userId); if (rl) return rl;
+  const r = await runRiskReview(db, userId);
+  await audit(db, userId, "ai_risk_review", { ok: r.ok }); done();
+  return r;
+}
+export async function makeReport(period: string) {
+  const p = z.enum(["daily", "weekly", "monthly"]).parse(period);
+  const { userId, db } = await ctx();
+  const r = await generateReport(db, userId, p);
+  await audit(db, userId, "report_generated", { period: p, ai: !r.aiError }); done();
+  return JSON.parse(JSON.stringify(r));
+}
+export async function runRiskMonitorNow() {
+  const { userId, db } = await ctx();
+  const log = await runRiskMonitor(db, userId);
+  await audit(db, userId, "manual_risk_monitor", { log }); done();
+  return log;
 }
 
 const TxInput = z.object({ portfolio_id: z.string().uuid(), type: z.enum(["deposit", "withdrawal", "buy", "sell", "dividend", "fee"]), symbol: z.string().max(20).optional(), qty: z.string().regex(/^\d+(\.\d+)?$/).optional(), price: z.string().regex(/^\d+(\.\d+)?$/).optional(), amount: z.string().regex(/^\d+(\.\d{1,10})?$/), note: z.string().max(200).optional() });

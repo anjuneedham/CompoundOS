@@ -60,7 +60,7 @@ export async function getPaperEngine(db: SupabaseClient, userId: string) {
 }
 
 /** One autonomous paper cycle: exits -> risk monitor -> strategy signals -> execution -> persist. */
-export async function runPaperCycle(db: SupabaseClient, userId: string, now = Date.now()) {
+export async function runPaperCycle(db: SupabaseClient, userId: string, now = Date.now(), opts: { entries?: boolean } = {}) {
   const { ctx, engine, broker, day, today } = await getPaperEngine(db, userId);
   const log: string[] = [];
   const bars = await setLatestPrices(broker, now);
@@ -80,7 +80,8 @@ export async function runPaperCycle(db: SupabaseClient, userId: string, now = Da
     log.push(`HALT: ${mon.breaches.join(",")}`);
   }
 
-  if (ctx.mode === "paper" && !engine.cfg.halts.global && !engine.cfg.halts.killSwitch) {
+  if (opts.entries === false) log.push("risk monitor only: no new entries");
+  else if (ctx.mode === "paper" && !engine.cfg.halts.global && !engine.cfg.halts.killSwitch) {
     for (const s of ctx.strategies.filter((x) => x.is_active && !x.is_halted)) {
       const def = STRATEGIES[s.kind]; if (!def) continue;
       const params = { ...def.defaults, ...s.params };
@@ -121,7 +122,15 @@ export async function activateKillSwitch(db: SupabaseClient, userId: string) {
   return closed;
 }
 
-function aiLogSink(db: SupabaseClient, userId: string) {
+export async function aiBudgetCheck(db: SupabaseClient, userId: string): Promise<{ ok: false; error: string } | null> {
+  const { data: s } = await db.from("user_settings").select("ai_daily_token_budget").eq("user_id", userId).single();
+  const since = new Date(); since.setUTCHours(0, 0, 0, 0);
+  const { data: used } = await db.from("ai_decision_logs").select("input_tokens,output_tokens").eq("user_id", userId).gte("created_at", since.toISOString());
+  const spent = (used ?? []).reduce((a, r) => a + r.input_tokens + r.output_tokens, 0);
+  return s && spent >= s.ai_daily_token_budget ? { ok: false, error: `daily AI token budget reached (${spent}/${s.ai_daily_token_budget})` } : null;
+}
+
+export function aiLogSink(db: SupabaseClient, userId: string) {
   return { record: async (e: { capability: string; inputHash: string; ok: boolean; output?: unknown; error?: string; inputTokens: number; outputTokens: number; model: string; cached: boolean }) => {
     await db.from("ai_decision_logs").insert({ user_id: userId, capability: e.capability, input_hash: e.inputHash, ok: e.ok, error: e.error ?? null, model: e.model, input_tokens: e.inputTokens, output_tokens: e.outputTokens, cached: e.cached });
     if (e.ok && !e.cached) await db.from("ai_research").insert({ user_id: userId, capability: e.capability, input_hash: e.inputHash, output: e.output });
@@ -141,13 +150,8 @@ export function marketBrief(symbol: string, now = Date.now()) {
 }
 
 export async function runAiResearch(db: SupabaseClient, userId: string, symbol: string, { execute }: { execute: boolean }) {
-  // daily token budget enforcement
-  const { data: s } = await db.from("user_settings").select("ai_daily_token_budget").eq("user_id", userId).single();
-  const since = new Date(); since.setUTCHours(0, 0, 0, 0);
-  const { data: used } = await db.from("ai_decision_logs").select("input_tokens,output_tokens").eq("user_id", userId).gte("created_at", since.toISOString());
-  const spent = (used ?? []).reduce((a, r) => a + r.input_tokens + r.output_tokens, 0);
-  if (s && spent >= s.ai_daily_token_budget) return { ok: false, error: `daily AI token budget reached (${spent}/${s.ai_daily_token_budget})` };
-
+  const budget = await aiBudgetCheck(db, userId);
+  if (budget) return budget;
   const ai = new AiOrchestrator(createAnthropicTransport(), aiLogSink(db, userId));
   if (!ai.available) return { ok: false, error: "AI unavailable: ANTHROPIC_API_KEY not configured on the server. Risk controls and paper trading continue to work." };
   const brief = marketBrief(symbol);
@@ -167,4 +171,20 @@ export async function runAiResearch(db: SupabaseClient, userId: string, symbol: 
   }
   await db.from("ai_trade_proposals").insert({ user_id: userId, symbol, action: p.data.action, side: p.data.side, entry_price: p.data.entryPrice, stop_loss: p.data.stopLoss, take_profit: p.data.takeProfit, rationale: p.data.rationale, confidence: p.data.confidence, risk_approved: riskApproved, rejection_reasons: reasons });
   return { ok: true as const, assessment: a.data, proposal: p.data, riskApproved, executed, reasons };
+}
+
+/** Risk monitor job: marks positions, processes stops/targets, enforces hard limits. Never opens trades. */
+export const runRiskMonitor = (db: SupabaseClient, userId: string) => runPaperCycle(db, userId, Date.now(), { entries: false });
+
+/** Scheduled AI research over the symbols of active strategies (max 3 per run, budget-limited). */
+export async function runScheduledResearch(db: SupabaseClient, userId: string) {
+  const ctx = await loadContext(db, userId);
+  const syms = [...new Set(ctx.strategies.filter((s) => s.is_active).flatMap((s) => s.symbols))].filter((s) => SIM_SYMBOLS.includes(s)).slice(0, 3);
+  const out: string[] = [];
+  for (const sym of syms.length ? syms : [SIM_SYMBOLS[0]]) {
+    const r = await runAiResearch(db, userId, sym, { execute: ctx.mode === "paper" });
+    out.push(`${sym}: ${r.ok ? `${r.proposal?.action}${r.executed ? " (executed)" : ""}` : r.error}`);
+    if (!r.ok) break;
+  }
+  return out;
 }
